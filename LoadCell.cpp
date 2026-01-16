@@ -9,13 +9,13 @@ LoadCell::LoadCell(int dout, int sck, float calFactor) {
 void LoadCell::begin() {
   _scale.begin(_dout, _sck);
   _scale.set_scale(_calFactor);
-  _scale.tare(); // 起動時の重さを0にする
+  _scale.tare(); 
 }
 
 float LoadCell::getForce() {
-  // 5回平均で取得（ループ速度を落としすぎないよう調整）
+  // サンプルの通り get_units(1) で1回のみ読み取り
   if (_scale.is_ready()) {
-    return _scale.get_units(5);
+    return _scale.get_units(1);
   } else {
     return 0.0f;
   }

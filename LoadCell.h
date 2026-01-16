@@ -11,16 +11,9 @@ class LoadCell {
     float _calFactor;
 
   public:
-    // コンストラクタ
     LoadCell(int dout, int sck, float calFactor);
-    
-    // 初期化と風袋引き（起動時に0点合わせ）
     void begin();
-    
-    // 現在の力（重さ）を取得
-    float getForce();
-    
-    // 再度0点合わせを行う
+    float getForce(); // get_units(1) を使用するように更新
     void tare();
 };
 
