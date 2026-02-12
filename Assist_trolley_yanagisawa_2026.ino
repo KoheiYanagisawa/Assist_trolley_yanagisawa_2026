@@ -8,8 +8,20 @@
 #include "IMUManager.h"
 #include "LoadCell.h"
 
+#define Red_LED 41
+#define Blue_LED 43
 // =====================================================
-// 4) インスタンス設定（元コード踏襲）
+// LED UI 用 状態管理
+// =====================================================
+enum SystemState {
+  STATE_BOOTING,   // 起動・初期化中
+  STATE_READY      // セットアップ完了
+};
+
+volatile SystemState sysState = STATE_BOOTING;
+
+// =====================================================
+// インスタンス設定
 // =====================================================
 Motor motorL(PIN_MOTOR_L_DIR, PIN_MOTOR_L_PWM);
 Motor motorR(PIN_MOTOR_R_DIR, PIN_MOTOR_R_PWM);
@@ -22,9 +34,7 @@ LoadCell handleR(23, 25, 74.64f);
 Encoder encL(200.0, 0.065, false);
 Encoder encR(200.0, 0.065, true);
 
-// 電流センサ（君の設定を踏襲）
-// (ピン, 感度, オフセット, 平均回数, KT定数)
-// ※ KT_VALUE がクラス内で何に使われているかは未確認なので据え置き
+// 電流センサ
 const double KT_VALUE = 2.7;
 ACS712 sensorL(PIN_CUR_L, 13.0, 512.0, 9, KT_VALUE);
 ACS712 sensorR(PIN_CUR_R, 13.0, 512.0, 9, KT_VALUE);
@@ -33,71 +43,84 @@ ACS712 sensorR(PIN_CUR_R, 13.0, 512.0, 9, KT_VALUE);
 IMUManager imu;
 
 // =====================================================
-// 5) 共有変数（割り込みとloopで共有）
+// 共有変数（ISRとloopで共有）
 // =====================================================
-volatile float fL_filt_g = 0.0f;
-volatile float fR_filt_g = 0.0f;
+// ロードセル保持（LPF後）
+volatile float fL_hold_g = 0.0f;
+volatile float fR_hold_g = 0.0f;
 
+// 電流LPF
 volatile float iL_filt_A = 0.0f;
 volatile float iR_filt_A = 0.0f;
 
+// ログ用（更新されてなかったのでちゃんと更新する）
 volatile float iL_ref_A = 0.0f;
 volatile float iR_ref_A = 0.0f;
+volatile int   pwmL_cmd  = 0;
+volatile int   pwmR_cmd  = 0;
 
-volatile int pwmL_cmd = 0;
-volatile int pwmR_cmd = 0;
+// 制御内部保持
+volatile float IrefL_hold = 0.0f;
+volatile float IrefR_hold = 0.0f;
 
-volatile float iL_integ = 0.0f;
-volatile float iR_integ = 0.0f;
+volatile float pwm_trim_L = 0.0f;
+volatile float pwm_trim_R = 0.0f;
 
-// 追加：ログ用の「押力」と「推定トルク」(制御loopで更新)
-volatile float push_mag_N = 0.0f;
-volatile int   push_dir   = 0;     // -1:後退, 0:無し, +1:前進
+volatile float pwm_cmd_L_hold = 0.0f;
+volatile float pwm_cmd_R_hold = 0.0f;
 
-volatile float tauMotorL_est_Nm = 0.0f;
-volatile float tauMotorR_est_Nm = 0.0f;
-volatile float tauTireL_est_Nm  = 0.0f;
-volatile float tauTireR_est_Nm  = 0.0f;
+volatile bool  drive_enable = false;
 
-
-volatile float fL_hold_g = 0.0f, fR_hold_g = 0.0f;
-
-volatile float IrefL_hold = 0.0f, IrefR_hold = 0.0f;
-volatile float pwm_ff_L_hold = 0.0f, pwm_ff_R_hold = 0.0f;
-
-volatile float pwm_trim_L = 0.0f, pwm_trim_R = 0.0f;
-volatile float pwm_cmd_L_hold = 0.0f, pwm_cmd_R_hold = 0.0f;
-
-volatile bool drive_enable = false;
-
+// ドリフト対策ゼロ点
 volatile float fL_zero_g = 0.0f;
 volatile float fR_zero_g = 0.0f;
-
-
-
 
 // =====================================================
 // エンコーダ割り込み
 // =====================================================
 void isrL() { encL.tick(digitalRead(PIN_ENC_L_B) == LOW); }
 void isrR() { encR.tick(digitalRead(PIN_ENC_R_B) == LOW); }
+// =====================================================
+// LED 更新関数
+// =====================================================
+void updateLED() {
+  static unsigned long lastBlink = 0;
+  static bool blinkState = false;
+  unsigned long now = millis();
 
+  switch (sysState) {
+    case STATE_BOOTING:
+      if (now - lastBlink >= 500) {
+        lastBlink = now;
+        blinkState = !blinkState;
+        digitalWrite(Red_LED, blinkState);
+      }
+      digitalWrite(Blue_LED, LOW);
+      break;
+
+    case STATE_READY:
+      digitalWrite(Red_LED, LOW);
+      digitalWrite(Blue_LED, HIGH);
+      break;
+  }
+}
 // =====================================================
 // ユーティリティ：符号付きデッドゾーン
 // =====================================================
 static inline float applyDeadzoneSigned(float x, float dz) {
-  if (x > dz) return x - dz;
+  if (x > dz)  return x - dz;
   if (x < -dz) return x + dz;
   return 0.0f;
 }
 
 // =====================================================
-// 8) 核：荷重 -> 目標電流 -> 電流PI -> PWM
+// 荷重 -> Iref -> PWM
+// ※制御周期系（Timer4/500Hz相当/分周）は現状維持
 // =====================================================
 void controlLoop() {
   static uint8_t lc_div = 0;
 
-  // ========= 500Hz：保持PWMを出力（ゲート込み） =========
+  // ========= 高頻度：保持PWMを出力（ゲート込み） =========
   if (!drive_enable) {
     motorL.drive(0);
     motorR.drive(0);
@@ -106,7 +129,7 @@ void controlLoop() {
     motorR.drive((int)pwm_cmd_R_hold);
   }
 
-  // ========= 80Hz：6回に1回だけ更新 =========
+  // ========= 80Hz：6回に1回だけ更新（現状維持） =========
   lc_div++;
   if (lc_div < 6) return;
   lc_div = 0;
@@ -118,38 +141,42 @@ void controlLoop() {
   fL_hold_g = (fL_raw * LPF_ALPHA_F) + (fL_hold_g * (1.0f - LPF_ALPHA_F));
   fR_hold_g = (fR_raw * LPF_ALPHA_F) + (fR_hold_g * (1.0f - LPF_ALPHA_F));
 
-  // =====================================================
-  // ドリフト対策：ゼロ点引き算 + 無入力時ゼロ追従
-  // =====================================================
+  // ---- ドリフト対策：ゼロ点引き算 + 無入力時ゼロ追従 ----
   float fL_corr_g = fL_hold_g - fL_zero_g;
   float fR_corr_g = fR_hold_g - fR_zero_g;
 
   float fL_eff_g = applyDeadzoneSigned(fL_corr_g, FORCE_DEADZONE_G);
   float fR_eff_g = applyDeadzoneSigned(fR_corr_g, FORCE_DEADZONE_G);
 
-  // ---- 無入力時のゼロ追従条件 ----
   const float ZERO_TRACK_TH_G = 30.0f;
   bool noInputForZero = (fabs(fL_corr_g) < ZERO_TRACK_TH_G) &&
                         (fabs(fR_corr_g) < ZERO_TRACK_TH_G);
-
   if (noInputForZero) {
     const float ZERO_ALPHA = 0.002f;
     fL_zero_g = (fL_hold_g * ZERO_ALPHA) + (fL_zero_g * (1.0f - ZERO_ALPHA));
     fR_zero_g = (fR_hold_g * ZERO_ALPHA) + (fR_zero_g * (1.0f - ZERO_ALPHA));
   }
 
-  // =====================================================
-  // 入力ゲート（連続0でOFF）
-  // =====================================================
+  // ---- 入力ゲート（連続0でOFF） ----
   static uint8_t noInputCnt = 0;
   bool noInput = (fabs(fL_eff_g) < 1e-6f) && (fabs(fR_eff_g) < 1e-6f);
 
   if (noInput) {
     if (++noInputCnt >= 10) {
       drive_enable = false;
-      pwm_trim_L = pwm_trim_R = 0.0f;
-      pwm_cmd_L_hold = pwm_cmd_R_hold = 0.0f;
-      IrefL_hold = IrefR_hold = 0.0f;
+      pwm_trim_L = 0.0f;
+      pwm_trim_R = 0.0f;
+      pwm_cmd_L_hold = 0.0f;
+      pwm_cmd_R_hold = 0.0f;
+      IrefL_hold = 0.0f;
+      IrefR_hold = 0.0f;
+
+      // ログ用もゼロに（見た目の混乱防止）
+      iL_ref_A = 0.0f;
+      iR_ref_A = 0.0f;
+      pwmL_cmd = 0;
+      pwmR_cmd = 0;
+
       noInputCnt = 0;
       return;
     }
@@ -185,12 +212,12 @@ void controlLoop() {
   float IabsL = fabs(iL_filt_A);
   float IabsR = fabs(iR_filt_A);
 
-  // ---- メイン：PWMフィードフォワード ----
+  // ---- PWMフィードフォワード ----
   float pwm_ff_L = K_PWM_I * I_L;
   float pwm_ff_R = K_PWM_I * I_R;
 
-  // ---- サブ：不足分だけ補正（trim） ----
-  const float Ts_trim = Ts * 6.0f;
+  // ---- 不足分だけtrim（現状維持） ----
+  const float Ts_trim = Ts * 6.0f; // ※周期系はいじらない条件なのでそのまま
 
   float eL = fabs(I_L) - IabsL;
   float eR = fabs(I_R) - IabsR;
@@ -217,13 +244,16 @@ void controlLoop() {
 
   pwm_cmd_L_hold = pwm_cmd_L;
   pwm_cmd_R_hold = pwm_cmd_R;
+
+  // ---- ログ用変数を更新（これが元コードで抜けてた） ----
+  iL_ref_A = IrefL_hold;
+  iR_ref_A = IrefR_hold;
+  pwmL_cmd  = (int)pwm_cmd_L_hold;
+  pwmR_cmd  = (int)pwm_cmd_R_hold;
 }
 
-
-
-
 // =====================================================
-// 6) 500Hzタイマー割り込みループ
+// Timer4 ISR（現状維持）
 // =====================================================
 ISR(TIMER4_COMPA_vect) {
   controlLoop();
@@ -233,6 +263,10 @@ ISR(TIMER4_COMPA_vect) {
 // setup
 // =====================================================
 void setup() {
+  pinMode(Red_LED, OUTPUT); 
+  pinMode(Blue_LED, OUTPUT); 
+  //sysState = STATE_BOOTING;
+  digitalWrite(Red_LED, 1);
   Serial.begin(115200);
   Wire.begin();
 
@@ -243,41 +277,87 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(PIN_ENC_L_A), isrL, RISING);
   attachInterrupt(digitalPinToInterrupt(PIN_ENC_R_A), isrR, RISING);
 
-  // --- Timer4 (500Hz) ---
-  // 16MHz / 64 = 250kHz
-  // 250kHz / 500Hz = 500 -> OCR4A = 499
+  // --- Timer4 (現状維持：数値もいじらない) ---
   noInterrupts();
   TCCR4A = 0;
   TCCR4B = 0;
   TCNT4  = 0;
-  OCR4A = 249;
+  OCR4A = 249;                         // ここはユーザ条件により変更しない
   TCCR4B |= (1 << WGM42);              // CTC
   TCCR4B |= (1 << CS41) | (1 << CS40); // prescaler 64
   TIMSK4 |= (1 << OCIE4A);             // enable compare match
   interrupts();
-
-  if (ENABLE_LOG) {
-    // Serial Plotterでも見やすい用（CSV列固定）
-    Serial.println("t_s,push_mag_N,push_dir,tauMotorL_Nm,tauMotorR_Nm,tauTireL_Nm,tauTireR_Nm,IrefL_A,ImeasL_A,pwmL,IrefR_A,ImeasR_A,pwmR");
-  }
-
-  Serial.println("System Ready (Current/Torque Control @500Hz)");
+  digitalWrite(Red_LED, 0);
+  sysState = STATE_READY;
+  Serial.println(
+    "t,"
+    "fL_g,"
+    "fR_g,"
+    "distL,"
+    "distR,"
+    //"iL_ref,"
+    "iL,"
+    "pwmL,"
+    //"iR_ref,"
+    "iR,"
+    "pwmR,"
+    //"roll,"
+    //"pitch,"
+    //"yaw"
+  );
 }
 
 // =====================================================
-// loop：ロギング（押力Nとトルク推定が主役）
+// loop：ロギング（周期は元のまま100ms）
 // =====================================================
 void loop() {
+  updateLED();
   static unsigned long lastPrint = 0;
   unsigned long now = millis();
 
-  if (now - lastPrint >= 50) {   // 20Hzで表示
+  // IMU更新（元のまま）
+  //imu.update();
+
+  if (now - lastPrint >= 100) {
     lastPrint = now;
 
-    // 80Hz側で更新している保持値をそのまま表示
-    Serial.print(fL_hold_g, 2);
-    Serial.print(",");
-    Serial.println(fR_hold_g, 2);
+    // IMU値
+    // float roll  = imu.getRoll();
+    // float pitch = imu.getPitch();
+    // float yaw   = imu.getYaw();
+
+    // 共有変数をスナップショット（途中更新を避ける）
+    float fL_g, fR_g, iLref, iRref, iL, iR;
+    int pwmL, pwmR;
+    float distL, distR;
+
+    noInterrupts();
+    fL_g  = fL_hold_g;
+    fR_g  = fR_hold_g;
+    iLref = iL_ref_A;
+    iRref = iR_ref_A;
+    iL    = iL_filt_A;
+    iR    = iR_filt_A;
+    pwmL  = pwmL_cmd;
+    pwmR  = pwmR_cmd;
+    interrupts();
+
+    distL = encL.getDistance();
+    distR = encR.getDistance();
+
+    Serial.print(now / 1000.0, 3); Serial.print(",");
+    Serial.print(fL_g, 1);         Serial.print(",");
+    Serial.print(fR_g, 1);         Serial.print(",");
+    Serial.print(distL, 3);        Serial.print(",");
+    Serial.print(distR, 3);        Serial.print(",");
+    //Serial.print(iLref, 3);        Serial.print(",");
+    Serial.print(iL, 3);           Serial.print(",");
+    Serial.print(pwmL);            Serial.print(",");
+    //Serial.print(iRref, 3);        Serial.print(",");
+    Serial.print(iR, 3);           Serial.print(",");
+    Serial.println(pwmR);            //Serial.print(",");
+    // Serial.print(roll, 2);         Serial.print(",");
+    // Serial.print(pitch, 2);        Serial.print(",");
+    // Serial.println(yaw, 2);
   }
 }
-

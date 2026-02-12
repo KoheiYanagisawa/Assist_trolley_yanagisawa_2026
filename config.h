@@ -31,7 +31,7 @@ constexpr float KT = 0.054f;
 constexpr float G2N = 9.80665f / 1000.0f;  // [N/g]
 
 // 荷重(g)->推進力(N) のゲイン
-constexpr float K_F = 0.2f;               // [N/g] ★調整ポイント
+constexpr float K_F = 0.4f;               // [N/g] ★調整ポイント
 
 constexpr float FORCE_DEADZONE_G = 50.0f;  // [g] デッドゾーン（要望）
 constexpr float LPF_ALPHA_F      = 0.01f;   // 荷重LPF
