@@ -1,4 +1,7 @@
 #include <Wire.h>
+#include <math.h>
+
+#include "config.h"
 #include "ACS712.h"
 #include "Motor.h"
 #include "Encoder.h"
@@ -6,59 +9,10 @@
 #include "LoadCell.h"
 
 // =====================================================
-// 1) 物理・電気パラメータ（君の仕様ベース）
+// 4) インスタンス設定（元コード踏襲）
 // =====================================================
-const float Ts = 0.01f;              // 100Hz -> 0.01s
-const float VBUS = 24.0f;            // 24V
-const int   PWM_MAX_HW = 255;        // Arduino PWM最大
-
-// 駆動系：Φ60ローラがΦ300タイヤに接触
-const float R_TIRE   = 0.150f;       // タイヤ半径 [m] (Φ300)
-const float R_ROLLER = 0.030f;       // ローラ半径 [m] (Φ60)
-const float GEAR     = 10.0f;        // ギア比 10:1（モータ->出力軸）
-
-// 推定トルク定数 kt [Nm/A]
-// 60W/24V -> 2.5A程度、ギア後トルク1.35Nm -> ギア前0.135Nm なので
-// kt ≈ 0.135/2.5 = 0.054 Nm/A（目安）
-const float KT = 0.054f;             // [Nm/A] まずはこの値で開始（要最終調整）
-
-// =====================================================
-// 2) アシスト設計パラメータ
-// =====================================================
-// ロードセル出力は「g」っぽい想定（君の元コードを踏襲）
-// g -> N 変換
-const float G2N = 9.80665f / 1000.0f;   // [N/g]
-
-// 荷重→推進力のゲイン（核の外側）
-// 例：ハンドル1000gで推進力20N くらい出したいなら 20N/(1000g)=0.02
-const float K_F = 0.02f;               // [N/g] ★調整ポイント
-
-const float FORCE_DEADZONE_G = 50.0f; // [g] デッドゾーン（君の値）
-const float LPF_ALPHA_F      = 0.1f;   // 荷重LPF
-
-// 目標電流のデッドゾーン
-const float I_DEADZONE = 0.15f;        // [A] ★ノイズで微小駆動しないため
-
-// =====================================================
-// 3) 電流PI（トルク制御の核）
-// =====================================================
-// まずは「安定寄り」初期値（あとで上げる）
-const float KP_I = 60.0f;              // [PWM/A] ★調整ポイント
-const float KI_I = 200.0f;             // [PWM/(A*s)] ★調整ポイント
-
-// 電流LPF（ACS712がバタつくなら）
-const float LPF_ALPHA_I = 0.3f;
-
-// 安全制限
-const int PWM_LIMIT = 200;             // 君の安全制限を踏襲
-const float I_REF_LIMIT = 3.0f;         // [A] まずは控えめ（定格2.5A近辺）
-
-// =====================================================
-// 4) インスタンス設定
-// =====================================================
-// モーター (DIR, PWM)
-Motor motorL(12, 11);
-Motor motorR(10, 9);
+Motor motorL(PIN_MOTOR_L_DIR, PIN_MOTOR_L_PWM);
+Motor motorR(PIN_MOTOR_R_DIR, PIN_MOTOR_R_PWM);
 
 // ロードセル (DOUT, SCK, 係数)
 LoadCell handleL(27, 29, 74.64f);
@@ -70,9 +24,10 @@ Encoder encR(200.0, 0.065, true);
 
 // 電流センサ（君の設定を踏襲）
 // (ピン, 感度, オフセット, 平均回数, KT定数)
-const double KT_VALUE = 2.7l;  // ※このKT_VALUEはACS712クラス内で何に使っているか要確認
-ACS712 sensorL(A3, 13.0, 512.0, 9, KT_VALUE);
-ACS712 sensorR(A2, 13.0, 512.0, 9, KT_VALUE);
+// ※ KT_VALUE がクラス内で何に使われているかは未確認なので据え置き
+const double KT_VALUE = 2.7;
+ACS712 sensorL(PIN_CUR_L, 13.0, 512.0, 9, KT_VALUE);
+ACS712 sensorR(PIN_CUR_R, 13.0, 512.0, 9, KT_VALUE);
 
 // IMU
 IMUManager imu;
@@ -92,23 +47,43 @@ volatile float iR_ref_A = 0.0f;
 volatile int pwmL_cmd = 0;
 volatile int pwmR_cmd = 0;
 
-// PIの積分（PWM単位で持つ：u = KP*e + integ）
 volatile float iL_integ = 0.0f;
 volatile float iR_integ = 0.0f;
 
-// エンコーダ割り込み用ブリッジ
-void isrL() { encL.tick(digitalRead(4) == LOW); }
-void isrR() { encR.tick(digitalRead(6) == LOW); }
+// 追加：ログ用の「押力」と「推定トルク」(制御loopで更新)
+volatile float push_mag_N = 0.0f;
+volatile int   push_dir   = 0;     // -1:後退, 0:無し, +1:前進
+
+volatile float tauMotorL_est_Nm = 0.0f;
+volatile float tauMotorR_est_Nm = 0.0f;
+volatile float tauTireL_est_Nm  = 0.0f;
+volatile float tauTireR_est_Nm  = 0.0f;
+
+
+volatile float fL_hold_g = 0.0f, fR_hold_g = 0.0f;
+
+volatile float IrefL_hold = 0.0f, IrefR_hold = 0.0f;
+volatile float pwm_ff_L_hold = 0.0f, pwm_ff_R_hold = 0.0f;
+
+volatile float pwm_trim_L = 0.0f, pwm_trim_R = 0.0f;
+volatile float pwm_cmd_L_hold = 0.0f, pwm_cmd_R_hold = 0.0f;
+
+volatile bool drive_enable = false;
+
+volatile float fL_zero_g = 0.0f;
+volatile float fR_zero_g = 0.0f;
+
+
+
 
 // =====================================================
-// 6) 100Hzタイマー割り込みループ
+// エンコーダ割り込み
 // =====================================================
-ISR(TIMER4_COMPA_vect) {
-  controlLoop();
-}
+void isrL() { encL.tick(digitalRead(PIN_ENC_L_B) == LOW); }
+void isrR() { encR.tick(digitalRead(PIN_ENC_R_B) == LOW); }
 
 // =====================================================
-// 7) ユーティリティ：符号付きデッドゾーン
+// ユーティリティ：符号付きデッドゾーン
 // =====================================================
 static inline float applyDeadzoneSigned(float x, float dz) {
   if (x > dz) return x - dz;
@@ -116,112 +91,146 @@ static inline float applyDeadzoneSigned(float x, float dz) {
   return 0.0f;
 }
 
-
 // =====================================================
 // 8) 核：荷重 -> 目標電流 -> 電流PI -> PWM
 // =====================================================
 void controlLoop() {
-  // =================================================
-  // ① ロードセル（生値 g）
-  // =================================================
-  float fL_raw_g = handleL.getForce();
-  float fR_raw_g = handleR.getForce();
+  static uint8_t lc_div = 0;
 
-  // =================================================
-  // ② ロードセルLPF（EMA）
-  // =================================================
-  fL_filt_g = (fL_raw_g * LPF_ALPHA_F) + (fL_filt_g * (1.0f - LPF_ALPHA_F));
-  fR_filt_g = (fR_raw_g * LPF_ALPHA_F) + (fR_filt_g * (1.0f - LPF_ALPHA_F));
-
-  // =================================================
-  // ③ デッドゾーン（±500g以下は0、超えた分だけ通す）
-  // =================================================
-  float fL_eff_g = applyDeadzoneSigned(fL_filt_g, FORCE_DEADZONE_G);
-  float fR_eff_g = applyDeadzoneSigned(fR_filt_g, FORCE_DEADZONE_G);
-
-  // ★ここ追加：無操作なら完全停止（積分もクリア）
-  const float STOP_EPS_G = 50.0f; // デッドゾーン後の残りがこれ以下なら無操作扱い
-  if (fabs(fL_eff_g) < STOP_EPS_G && fabs(fR_eff_g) < STOP_EPS_G) {
-    iL_ref_A = 0.0f;
-    iR_ref_A = 0.0f;
-    iL_integ = 0.0f;
-    iR_integ = 0.0f;
-    pwmL_cmd = 0;
-    pwmR_cmd = 0;
+  // ========= 500Hz：保持PWMを出力（ゲート込み） =========
+  if (!drive_enable) {
     motorL.drive(0);
     motorR.drive(0);
-    return;
+  } else {
+    motorL.drive((int)pwm_cmd_L_hold);
+    motorR.drive((int)pwm_cmd_R_hold);
   }
-  // =================================================
-  // ④ 外側：荷重(g) -> 推進力F[N] -> 目標電流Iref[A]
-  // =================================================
-  // 推進力（右は元コード踏襲で符号反転して前進方向を揃える）
-  float F_L_ref_N = K_F * (fL_eff_g);     // [N]
-  float F_R_ref_N = K_F * (-fR_eff_g);    // [N]
 
-  // Iref換算：
-  // tau_motor = F * R_ROLLER / GEAR
-  // Iref = tau_motor / KT
-  float I_L = (F_L_ref_N * R_ROLLER / GEAR) / KT;  // [A]
-  float I_R = (F_R_ref_N * R_ROLLER / GEAR) / KT;  // [A]
+  // ========= 80Hz：6回に1回だけ更新 =========
+  lc_div++;
+  if (lc_div < 6) return;
+  lc_div = 0;
 
-  // 微小電流は0に潰す
+  // ---- ロードセル取得＆LPF（80Hz側） ----
+  float fL_raw = handleL.getForce();
+  float fR_raw = handleR.getForce();
+
+  fL_hold_g = (fL_raw * LPF_ALPHA_F) + (fL_hold_g * (1.0f - LPF_ALPHA_F));
+  fR_hold_g = (fR_raw * LPF_ALPHA_F) + (fR_hold_g * (1.0f - LPF_ALPHA_F));
+
+  // =====================================================
+  // ドリフト対策：ゼロ点引き算 + 無入力時ゼロ追従
+  // =====================================================
+  float fL_corr_g = fL_hold_g - fL_zero_g;
+  float fR_corr_g = fR_hold_g - fR_zero_g;
+
+  float fL_eff_g = applyDeadzoneSigned(fL_corr_g, FORCE_DEADZONE_G);
+  float fR_eff_g = applyDeadzoneSigned(fR_corr_g, FORCE_DEADZONE_G);
+
+  // ---- 無入力時のゼロ追従条件 ----
+  const float ZERO_TRACK_TH_G = 30.0f;
+  bool noInputForZero = (fabs(fL_corr_g) < ZERO_TRACK_TH_G) &&
+                        (fabs(fR_corr_g) < ZERO_TRACK_TH_G);
+
+  if (noInputForZero) {
+    const float ZERO_ALPHA = 0.002f;
+    fL_zero_g = (fL_hold_g * ZERO_ALPHA) + (fL_zero_g * (1.0f - ZERO_ALPHA));
+    fR_zero_g = (fR_hold_g * ZERO_ALPHA) + (fR_zero_g * (1.0f - ZERO_ALPHA));
+  }
+
+  // =====================================================
+  // 入力ゲート（連続0でOFF）
+  // =====================================================
+  static uint8_t noInputCnt = 0;
+  bool noInput = (fabs(fL_eff_g) < 1e-6f) && (fabs(fR_eff_g) < 1e-6f);
+
+  if (noInput) {
+    if (++noInputCnt >= 10) {
+      drive_enable = false;
+      pwm_trim_L = pwm_trim_R = 0.0f;
+      pwm_cmd_L_hold = pwm_cmd_R_hold = 0.0f;
+      IrefL_hold = IrefR_hold = 0.0f;
+      noInputCnt = 0;
+      return;
+    }
+  } else {
+    noInputCnt = 0;
+    drive_enable = true;
+  }
+
+  // ---- 外側：g -> F[N] ----
+  float F_L_ref_N = K_F * ( fL_eff_g);
+  float F_R_ref_N = K_F * (-fR_eff_g);
+
+  // ---- F -> Iref ----
+  float I_L = (F_L_ref_N * R_ROLLER / GEAR) / KT;
+  float I_R = (F_R_ref_N * R_ROLLER / GEAR) / KT;
+
   if (fabs(I_L) < I_DEADZONE) I_L = 0.0f;
   if (fabs(I_R) < I_DEADZONE) I_R = 0.0f;
 
-  // 安全上限
   I_L = constrain(I_L, -I_REF_LIMIT, I_REF_LIMIT);
   I_R = constrain(I_R, -I_REF_LIMIT, I_REF_LIMIT);
 
-  iL_ref_A = I_L;
-  iR_ref_A = I_R;
+  IrefL_hold = I_L;
+  IrefR_hold = I_R;
 
-  // =================================================
-  // ⑤ 電流計測（ACS712）+ LPF
-  // =================================================
-  float iL_meas = (float)sensorL.readCurrent();  // [A]（符号が信用できない想定）
-  float iR_meas = (float)sensorR.readCurrent();  // [A]
+  // ---- 電流計測＆LPF ----
+  float iL_meas = (float)sensorL.readCurrent();
+  float iR_meas = (float)sensorR.readCurrent();
 
   iL_filt_A = (iL_meas * LPF_ALPHA_I) + (iL_filt_A * (1.0f - LPF_ALPHA_I));
   iR_filt_A = (iR_meas * LPF_ALPHA_I) + (iR_filt_A * (1.0f - LPF_ALPHA_I));
 
-  // “符号付き実電流”を作る（符号はIrefの符号から付ける）
-  float iL_signed = (I_L >= 0.0f ? 1.0f : -1.0f) * fabs(iL_filt_A);
-  float iR_signed = (I_R >= 0.0f ? 1.0f : -1.0f) * fabs(iR_filt_A);
+  float IabsL = fabs(iL_filt_A);
+  float IabsR = fabs(iR_filt_A);
 
-  // =================================================
-  // ⑥ 内側：電流PI（Iref追従 → PWM生成）
-  // =================================================
-  float eL = I_L - iL_signed;
-  float eR = I_R - iR_signed;
+  // ---- メイン：PWMフィードフォワード ----
+  float pwm_ff_L = K_PWM_I * I_L;
+  float pwm_ff_R = K_PWM_I * I_R;
 
-  // 積分（PWM単位で保持）
-  iL_integ += (KI_I * eL * Ts);
-  iR_integ += (KI_I * eR * Ts);
+  // ---- サブ：不足分だけ補正（trim） ----
+  const float Ts_trim = Ts * 6.0f;
 
-  float uL = KP_I * eL + iL_integ;
-  float uR = KP_I * eR + iR_integ;
+  float eL = fabs(I_L) - IabsL;
+  float eR = fabs(I_R) - IabsR;
 
-  // 飽和
-  float uL_sat = constrain(uL, -PWM_LIMIT, PWM_LIMIT);
-  float uR_sat = constrain(uR, -PWM_LIMIT, PWM_LIMIT);
+  pwm_trim_L += KI_TRIM * eL * Ts_trim;
+  pwm_trim_R += KI_TRIM * eR * Ts_trim;
 
-  // 簡易アンチワインドアップ（飽和分だけ積分を戻す）
-  iL_integ += (uL_sat - uL);
-  iR_integ += (uR_sat - uR);
+  pwm_trim_L = constrain(pwm_trim_L, 0.0f, PWM_TRIM_MAX);
+  pwm_trim_R = constrain(pwm_trim_R, 0.0f, PWM_TRIM_MAX);
 
-  pwmL_cmd = (int)uL_sat;
-  pwmR_cmd = (int)uR_sat;
+  // ---- 合成PWM ----
+  float pwm_cmd_L = pwm_ff_L + (I_L >= 0 ? +pwm_trim_L : -pwm_trim_L);
+  float pwm_cmd_R = pwm_ff_R + (I_R >= 0 ? +pwm_trim_R : -pwm_trim_R);
 
-  // =================================================
-  // ⑦ 出力
-  // =================================================
-  motorL.drive(-pwmL_cmd);
-  motorR.drive(pwmR_cmd);
+  pwm_cmd_L = constrain(pwm_cmd_L, -PWM_LIMIT, PWM_LIMIT);
+  pwm_cmd_R = constrain(pwm_cmd_R, -PWM_LIMIT, PWM_LIMIT);
+
+  // ---- 低PWMガタ防止 ----
+  const int PWM_MIN = 25;
+  if (pwm_cmd_L > 0) pwm_cmd_L = max(pwm_cmd_L, (float)PWM_MIN);
+  if (pwm_cmd_L < 0) pwm_cmd_L = min(pwm_cmd_L, (float)-PWM_MIN);
+  if (pwm_cmd_R > 0) pwm_cmd_R = max(pwm_cmd_R, (float)PWM_MIN);
+  if (pwm_cmd_R < 0) pwm_cmd_R = min(pwm_cmd_R, (float)-PWM_MIN);
+
+  pwm_cmd_L_hold = pwm_cmd_L;
+  pwm_cmd_R_hold = pwm_cmd_R;
+}
+
+
+
+
+// =====================================================
+// 6) 500Hzタイマー割り込みループ
+// =====================================================
+ISR(TIMER4_COMPA_vect) {
+  controlLoop();
 }
 
 // =====================================================
-// 9) setup
+// setup
 // =====================================================
 void setup() {
   Serial.begin(115200);
@@ -231,46 +240,44 @@ void setup() {
   handleL.begin();
   handleR.begin();
 
-  attachInterrupt(digitalPinToInterrupt(2), isrL, RISING);
-  attachInterrupt(digitalPinToInterrupt(3), isrR, RISING);
+  attachInterrupt(digitalPinToInterrupt(PIN_ENC_L_A), isrL, RISING);
+  attachInterrupt(digitalPinToInterrupt(PIN_ENC_R_A), isrR, RISING);
 
-  // --- Timer4 (100Hz) ---
+  // --- Timer4 (500Hz) ---
+  // 16MHz / 64 = 250kHz
+  // 250kHz / 500Hz = 500 -> OCR4A = 499
   noInterrupts();
   TCCR4A = 0;
   TCCR4B = 0;
   TCNT4  = 0;
-  OCR4A = 499;                      // 100Hz (16MHz / 64 / 100 - 1)
-  TCCR4B |= (1 << WGM42);            // CTC
+  OCR4A = 249;
+  TCCR4B |= (1 << WGM42);              // CTC
   TCCR4B |= (1 << CS41) | (1 << CS40); // prescaler 64
-  TIMSK4 |= (1 << OCIE4A);           // enable compare match
+  TIMSK4 |= (1 << OCIE4A);             // enable compare match
   interrupts();
 
-  Serial.println("System Ready (Torque(Current) Control @100Hz)");
+  if (ENABLE_LOG) {
+    // Serial Plotterでも見やすい用（CSV列固定）
+    Serial.println("t_s,push_mag_N,push_dir,tauMotorL_Nm,tauMotorR_Nm,tauTireL_Nm,tauTireR_Nm,IrefL_A,ImeasL_A,pwmL,IrefR_A,ImeasR_A,pwmR");
+  }
+
+  Serial.println("System Ready (Current/Torque Control @500Hz)");
 }
 
 // =====================================================
-// 10) loop：ロギング（Iref/Imeasも出す）
+// loop：ロギング（押力Nとトルク推定が主役）
 // =====================================================
 void loop() {
   static unsigned long lastPrint = 0;
   unsigned long now = millis();
 
-  if (now - lastPrint >= 50) {  // 20Hz
+  if (now - lastPrint >= 50) {   // 20Hzで表示
     lastPrint = now;
 
-    imu.update();
-
-    // CSV: t, fL_g, fR_g, distL, distR, IrefL, ImeasL, pwmL, IrefR, ImeasR, pwmR
-    Serial.print(now / 1000.0, 3);   Serial.print(",");
-    Serial.print(fL_filt_g, 1);      Serial.print(",");
-    Serial.print(fR_filt_g, 1);      Serial.print(",");
-    Serial.print(encL.getDistance(), 3); Serial.print(",");
-    Serial.print(encR.getDistance(), 3); Serial.print(",");
-    Serial.print(iL_ref_A, 3);       Serial.print(",");
-    Serial.print(iL_filt_A, 3);      Serial.print(",");
-    Serial.print(pwmL_cmd);          Serial.print(",");
-    Serial.print(iR_ref_A, 3);       Serial.print(",");
-    Serial.print(iR_filt_A, 3);      Serial.print(",");
-    Serial.println(pwmR_cmd);
+    // 80Hz側で更新している保持値をそのまま表示
+    Serial.print(fL_hold_g, 2);
+    Serial.print(",");
+    Serial.println(fR_hold_g, 2);
   }
 }
+
